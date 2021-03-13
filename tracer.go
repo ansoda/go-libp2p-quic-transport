@@ -18,7 +18,8 @@ type tracer struct {
 var _ logging.Tracer = &tracer{}
 
 func newTracer(node peer.ID) logging.Tracer {
-	return &tracer{node: node}
+	tracers := []logging.Tracer{&metricsTracer{}, &tracer{node: node}}
+	return logging.NewMultiplexedTracer(tracers...)
 }
 
 func (t *tracer) SentPacket(net.Addr, *logging.Header, logging.ByteCount, []logging.Frame) {}
