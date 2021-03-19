@@ -2,6 +2,7 @@ package libp2pquic
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"github.com/lucas-clemente/quic-go/logging"
@@ -18,6 +19,68 @@ var (
 	connErrors      *prometheus.CounterVec
 	// connDuration *prometheus.HistogramVec
 )
+
+type aggregatingCollector struct {
+	mutex sync.Mutex
+	conns map[string] /* conn ID */ *metricsConnTracer
+}
+
+func newAggregatingCollector() *aggregatingCollector {
+	return &aggregatingCollector{conns: make(map[string]*metricsConnTracer)}
+}
+
+var _ prometheus.Collector = &aggregatingCollector{}
+
+func (c *aggregatingCollector) newRTTHistogram() prometheus.Summary {
+	return prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "quic_smoothed_rtt",
+		Help:    "Smoothed RTT",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.015, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1, 1.5, 2, 5},
+	})
+}
+
+func (c *aggregatingCollector) newConnectionDurationHistogram() prometheus.Summary {
+	return prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "quic_connection_duration",
+		Help:    "Connection Duration",
+		Buckets: []float64{1, 5, 10, 30, 60, 10 * 60, 30 * 60, 3600, 3 * 3600, 12 * 3600, 24 * 3600, 7 * 24 * 3600, 31 * 24 * 3600},
+	})
+}
+
+func (c *aggregatingCollector) Describe(descs chan<- *prometheus.Desc) {
+	descs <- c.newRTTHistogram().Desc()
+	descs <- c.newConnectionDurationHistogram().Desc()
+}
+
+func (c *aggregatingCollector) Collect(metrics chan<- prometheus.Metric) {
+	now := time.Now()
+	rtts := c.newRTTHistogram()
+	connDurations := c.newConnectionDurationHistogram()
+	c.mutex.Lock()
+	for _, conn := range c.conns {
+		if rtt, valid := conn.getSmoothedRTT(); valid {
+			rtts.Observe(rtt.Seconds())
+		}
+		connDurations.Observe(now.Sub(conn.startTime).Seconds())
+	}
+	c.mutex.Unlock()
+	metrics <- rtts
+	metrics <- connDurations
+}
+
+func (c *aggregatingCollector) AddConn(id string, t *metricsConnTracer) {
+	c.mutex.Lock()
+	c.conns[id] = t
+	c.mutex.Unlock()
+}
+
+func (c *aggregatingCollector) RemoveConn(id string) {
+	c.mutex.Lock()
+	delete(c.conns, id)
+	c.mutex.Unlock()
+}
+
+var collector *aggregatingCollector
 
 func init() {
 	const (
@@ -81,25 +144,14 @@ func init() {
 		[]string{encLevel, "reason"},
 	)
 	prometheus.MustRegister(lostPackets)
-	// var buckets []float64
-	// for _, d := range []time.Duration{time.Second, 10*time.Second, time.Minute, 10*time.Second, time.Hour, 24*time.Hour, 7*24*time.Hour} {
-	// 	buckets = append(buckets, d.Seconds())
-	// }
-	// connDuration = prometheus.NewHistogramVec(
-	// 	prometheus.HistogramOpts{
-	// 		Name: "quic_connection_duration",
-	// 		Help: "duration of QUIC connections",
-	// 		Buckets: buckets,
-	// 	},
-	// 	[]string{direction},
-	// )
-	// prometheus.MustRegister(connDuration)
+	collector = newAggregatingCollector()
+	prometheus.MustRegister(collector)
 }
 
 type metricsTracer struct{}
 
-func (m *metricsTracer) TracerForConnection(p logging.Perspective, _ logging.ConnectionID) logging.ConnectionTracer {
-	return &metricsConnTracer{perspective: p}
+func (m *metricsTracer) TracerForConnection(p logging.Perspective, connID logging.ConnectionID) logging.ConnectionTracer {
+	return &metricsConnTracer{perspective: p, connID: connID}
 }
 
 func (m *metricsTracer) SentPacket(addr net.Addr, header *logging.Header, count logging.ByteCount, frames []logging.Frame) {
@@ -111,6 +163,11 @@ func (m *metricsTracer) DroppedPacket(addr net.Addr, packetType logging.PacketTy
 type metricsConnTracer struct {
 	perspective logging.Perspective
 	startTime   time.Time
+	connID      logging.ConnectionID
+
+	mutex              sync.Mutex
+	numRTTMeasurements int
+	rtt                time.Duration
 }
 
 var _ logging.ConnectionTracer = &metricsConnTracer{}
@@ -142,6 +199,7 @@ func (m *metricsConnTracer) getEncLevel(packetType logging.PacketType) string {
 func (m *metricsConnTracer) StartedConnection(net.Addr, net.Addr, logging.VersionNumber, logging.ConnectionID, logging.ConnectionID) {
 	m.startTime = time.Now()
 	activeConns.WithLabelValues(m.getDirection()).Inc()
+	collector.AddConn(m.connID.String(), m)
 }
 
 func (m *metricsConnTracer) ClosedConnection(r logging.CloseReason) {
@@ -231,6 +289,10 @@ func (m *metricsConnTracer) DroppedPacket(packetType logging.PacketType, _ loggi
 }
 
 func (m *metricsConnTracer) UpdatedMetrics(rttStats *logging.RTTStats, cwnd, bytesInFlight logging.ByteCount, packetsInFlight int) {
+	m.mutex.Lock()
+	m.rtt = rttStats.SmoothedRTT()
+	m.numRTTMeasurements++
+	m.mutex.Unlock()
 }
 
 func (m *metricsConnTracer) LostPacket(level logging.EncryptionLevel, _ logging.PacketNumber, r logging.PacketLossReason) {
@@ -260,5 +322,16 @@ func (m *metricsConnTracer) LossTimerExpired(timerType logging.TimerType, level 
 }
 func (m *metricsConnTracer) LossTimerCanceled() {}
 
-func (m *metricsConnTracer) Close()                 {}
+func (m *metricsConnTracer) Close() {
+	collector.RemoveConn(m.connID.String())
+}
+
 func (m *metricsConnTracer) Debug(name, msg string) {}
+
+func (m *metricsConnTracer) getSmoothedRTT() (rtt time.Duration, valid bool) {
+	m.mutex.Lock()
+	rtt = m.rtt
+	valid = m.numRTTMeasurements > 10
+	m.mutex.Unlock()
+	return
+}
