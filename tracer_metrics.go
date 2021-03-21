@@ -11,6 +11,7 @@ import (
 
 var (
 	activeConns     *prometheus.GaugeVec
+	closedConns     *prometheus.CounterVec
 	sentPackets     *prometheus.CounterVec
 	rcvdPackets     *prometheus.CounterVec
 	bufferedPackets *prometheus.CounterVec
@@ -96,6 +97,14 @@ func init() {
 		[]string{direction},
 	)
 	prometheus.MustRegister(activeConns)
+	closedConns = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "quic_closed_connections",
+			Help: "closed QUIC connection",
+		},
+		[]string{direction},
+	)
+	prometheus.MustRegister(closedConns)
 	sentPackets = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "quic_sent_packets",
@@ -161,9 +170,10 @@ func (m *metricsTracer) DroppedPacket(addr net.Addr, packetType logging.PacketTy
 }
 
 type metricsConnTracer struct {
-	perspective logging.Perspective
-	startTime   time.Time
-	connID      logging.ConnectionID
+	perspective       logging.Perspective
+	startTime         time.Time
+	connID            logging.ConnectionID
+	handshakeComplete bool
 
 	mutex              sync.Mutex
 	numRTTMeasurements int
@@ -312,9 +322,13 @@ func (m *metricsConnTracer) UpdatedCongestionState(state logging.CongestionState
 func (m *metricsConnTracer) UpdatedPTOCount(value uint32)                         {}
 func (m *metricsConnTracer) UpdatedKeyFromTLS(level logging.EncryptionLevel, perspective logging.Perspective) {
 }
-func (m *metricsConnTracer) UpdatedKey(generation logging.KeyPhase, remote bool)  {}
-func (m *metricsConnTracer) DroppedEncryptionLevel(level logging.EncryptionLevel) {}
-func (m *metricsConnTracer) DroppedKey(generation logging.KeyPhase)               {}
+func (m *metricsConnTracer) UpdatedKey(generation logging.KeyPhase, remote bool) {}
+func (m *metricsConnTracer) DroppedEncryptionLevel(level logging.EncryptionLevel) {
+	if level == logging.EncryptionHandshake {
+		m.handshakeComplete = true
+	}
+}
+func (m *metricsConnTracer) DroppedKey(generation logging.KeyPhase) {}
 func (m *metricsConnTracer) SetLossTimer(timerType logging.TimerType, level logging.EncryptionLevel, time time.Time) {
 }
 
@@ -323,6 +337,9 @@ func (m *metricsConnTracer) LossTimerExpired(timerType logging.TimerType, level 
 func (m *metricsConnTracer) LossTimerCanceled() {}
 
 func (m *metricsConnTracer) Close() {
+	if m.handshakeComplete {
+		closedConns.WithLabelValues(m.getDirection()).Inc()
+	}
 	collector.RemoveConn(m.connID.String())
 }
 
