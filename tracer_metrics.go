@@ -11,6 +11,7 @@ import (
 
 var (
 	activeConns     *prometheus.GaugeVec
+	newConns        *prometheus.CounterVec
 	closedConns     *prometheus.CounterVec
 	sentPackets     *prometheus.CounterVec
 	rcvdPackets     *prometheus.CounterVec
@@ -105,6 +106,14 @@ func init() {
 		[]string{direction},
 	)
 	prometheus.MustRegister(closedConns)
+	newConns = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "quic_new_connections",
+			Help: "new QUIC connection",
+		},
+		[]string{direction, "handshake_successful"},
+	)
+	prometheus.MustRegister(newConns)
 	sentPackets = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "quic_sent_packets",
@@ -325,7 +334,7 @@ func (m *metricsConnTracer) UpdatedKeyFromTLS(level logging.EncryptionLevel, per
 func (m *metricsConnTracer) UpdatedKey(generation logging.KeyPhase, remote bool) {}
 func (m *metricsConnTracer) DroppedEncryptionLevel(level logging.EncryptionLevel) {
 	if level == logging.EncryptionHandshake {
-		m.handshakeComplete = true
+		m.handleHandshakeComplete()
 	}
 }
 func (m *metricsConnTracer) DroppedKey(generation logging.KeyPhase) {}
@@ -339,11 +348,18 @@ func (m *metricsConnTracer) LossTimerCanceled() {}
 func (m *metricsConnTracer) Close() {
 	if m.handshakeComplete {
 		closedConns.WithLabelValues(m.getDirection()).Inc()
+	} else {
+		newConns.WithLabelValues(m.getDirection(), "false").Inc()
 	}
 	collector.RemoveConn(m.connID.String())
 }
 
 func (m *metricsConnTracer) Debug(name, msg string) {}
+
+func (m *metricsConnTracer) handleHandshakeComplete() {
+	m.handshakeComplete = true
+	newConns.WithLabelValues(m.getDirection(), "true").Inc()
+}
 
 func (m *metricsConnTracer) getSmoothedRTT() (rtt time.Duration, valid bool) {
 	m.mutex.Lock()
