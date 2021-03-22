@@ -11,6 +11,7 @@ import (
 
 var (
 	activeConns     *prometheus.GaugeVec
+	bytesTransferred 		*prometheus.CounterVec
 	newConns        *prometheus.CounterVec
 	closedConns     *prometheus.CounterVec
 	sentPackets     *prometheus.CounterVec
@@ -114,6 +115,14 @@ func init() {
 		[]string{direction, "handshake_successful"},
 	)
 	prometheus.MustRegister(newConns)
+	bytesTransferred = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "quic_bytes_transferred",
+			Help: "QUIC bytes transferred",
+		},
+		[]string{direction}, // TODO: this is confusing. Other times, we use direction for the perspective
+	)
+	prometheus.MustRegister(bytesTransferred)
 	sentPackets = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "quic_sent_packets",
@@ -172,7 +181,8 @@ func (m *metricsTracer) TracerForConnection(p logging.Perspective, connID loggin
 	return &metricsConnTracer{perspective: p, connID: connID}
 }
 
-func (m *metricsTracer) SentPacket(addr net.Addr, header *logging.Header, count logging.ByteCount, frames []logging.Frame) {
+func (m *metricsTracer) SentPacket(_ net.Addr, _ *logging.Header, size logging.ByteCount, _ []logging.Frame) {
+	bytesTransferred.WithLabelValues("sent").Add(float64(size))
 }
 
 func (m *metricsTracer) DroppedPacket(addr net.Addr, packetType logging.PacketType, count logging.ByteCount, reason logging.PacketDropReason) {
@@ -256,11 +266,13 @@ func (m *metricsConnTracer) ClosedConnection(r logging.CloseReason) {
 func (m *metricsConnTracer) SentTransportParameters(parameters *logging.TransportParameters)     {}
 func (m *metricsConnTracer) ReceivedTransportParameters(parameters *logging.TransportParameters) {}
 func (m *metricsConnTracer) RestoredTransportParameters(parameters *logging.TransportParameters) {}
-func (m *metricsConnTracer) SentPacket(hdr *logging.ExtendedHeader, _ logging.ByteCount, _ *logging.AckFrame, _ []logging.Frame) {
+func (m *metricsConnTracer) SentPacket(hdr *logging.ExtendedHeader, size logging.ByteCount, _ *logging.AckFrame, _ []logging.Frame) {
+	bytesTransferred.WithLabelValues("sent").Add(float64(size))
 	sentPackets.WithLabelValues(m.getEncLevel(logging.PacketTypeFromHeader(&hdr.Header))).Inc()
 }
 
-func (m *metricsConnTracer) ReceivedVersionNegotiationPacket(*logging.Header, []logging.VersionNumber) {
+func (m *metricsConnTracer) ReceivedVersionNegotiationPacket(hdr *logging.Header, v []logging.VersionNumber) {
+	bytesTransferred.WithLabelValues("rcvd").Add(float64(hdr.ParsedLen() + logging.ByteCount(4*len(v))))
 	rcvdPackets.WithLabelValues("Version Negotiation").Inc()
 }
 
@@ -268,7 +280,8 @@ func (m *metricsConnTracer) ReceivedRetry(*logging.Header) {
 	rcvdPackets.WithLabelValues("Retry").Inc()
 }
 
-func (m *metricsConnTracer) ReceivedPacket(hdr *logging.ExtendedHeader, _ logging.ByteCount, _ []logging.Frame) {
+func (m *metricsConnTracer) ReceivedPacket(hdr *logging.ExtendedHeader, size logging.ByteCount, _ []logging.Frame) {
+	bytesTransferred.WithLabelValues("rcvd").Add(float64(size))
 	rcvdPackets.WithLabelValues(m.getEncLevel(logging.PacketTypeFromHeader(&hdr.Header))).Inc()
 }
 
@@ -276,7 +289,8 @@ func (m *metricsConnTracer) BufferedPacket(packetType logging.PacketType) {
 	bufferedPackets.WithLabelValues(m.getEncLevel(packetType)).Inc()
 }
 
-func (m *metricsConnTracer) DroppedPacket(packetType logging.PacketType, _ logging.ByteCount, r logging.PacketDropReason) {
+func (m *metricsConnTracer) DroppedPacket(packetType logging.PacketType, size logging.ByteCount, r logging.PacketDropReason) {
+	bytesTransferred.WithLabelValues("rcvd").Add(float64(size))
 	var reason string
 	switch r {
 	case logging.PacketDropKeyUnavailable:
